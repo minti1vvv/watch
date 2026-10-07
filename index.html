@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nanachi Watch</title>
+<style>
+:root{--bg:#eceff3;--panel:#fff;--ink:#14202b;--mute:#5d6b78;--line:#d3d9e0;--ac:#1f4fd8;--acx:#fff;--ok:#18794e;--bad:#b3261e}
+@media (prefers-color-scheme:dark){:root{--bg:#0f141a;--panel:#18202a;--ink:#e6ebf0;--mute:#8d9aa7;--line:#2a3541;--ac:#6f95ff;--acx:#0b1220;--ok:#4cc38a;--bad:#ff8a80}}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:16px;max-width:560px;margin:0 auto}
+h1{font-size:20px;margin:4px 0 14px;font-weight:650}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
+h2{font-size:15px;margin:0 0 10px;font-weight:650}
+button{font:inherit;border:1px solid var(--ac);background:var(--ac);color:var(--acx);border-radius:8px;padding:10px 14px;cursor:pointer}
+button.ghost{background:transparent;color:var(--ac)}
+button:disabled{opacity:.45;cursor:default}
+button:focus-visible,textarea:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+textarea{font:inherit;width:100%;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:10px;min-height:220px;resize:vertical}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.st{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--mute)}
+.on .dot{background:var(--ok)}
+.meta{color:var(--mute);font-size:13px;margin-top:8px}
+.err{color:var(--bad)}
+</style>
+</head>
+<body>
+<h1>Nanachi Watch</h1>
+
+<section id="conn">
+  <div class="st"><span class="dot"></span><span id="state">Не подключено</span></div>
+  <div class="row">
+    <button id="bConnect">Подключить часы</button>
+    <button id="bDisc" class="ghost" disabled>Отключить</button>
+  </div>
+  <div class="meta" id="support"></div>
+</section>
+
+<section>
+  <h2>Время и погода</h2>
+  <div id="wx">Погода определяется по вашему местоположению.</div>
+  <div class="row" style="margin-top:10px">
+    <button id="bSync" class="ghost" disabled>Обновить сейчас</button>
+  </div>
+  <div class="meta">Всё отправляется само при подключении и каждые 30 минут, пока страница открыта.</div>
+</section>
+
+<section>
+  <h2>Заметка</h2>
+  <textarea id="note" placeholder="Текст заметки. Абзацы сохраняются."></textarea>
+  <div class="row" style="margin-top:10px">
+    <button id="bSend" disabled>Отправить на часы</button>
+    <button id="bLoad" class="ghost" disabled>Загрузить с часов</button>
+    <span class="meta" id="count" style="margin:0"></span>
+  </div>
+</section>
+
+<div class="meta" id="log" role="status"></div>
+
+<script>
+const SERVICE='6e400001-b5a3-f393-e0a9-e50e24dcca9e', RX='6e400002-b5a3-f393-e0a9-e50e24dcca9e', TX='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const MAX_BYTES=3900, CHUNK=100;
+const $=id=>document.getElementById(id);
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const enc=new TextEncoder(), dec=new TextDecoder();
+let dev=null, rx=null, tx=null, timer=null, manualOff=false;
+
+function log(msg,bad){const el=$('log');el.textContent=msg;el.className='meta'+(bad?' err':'');}
+function setUi(on){
+  $('conn').classList.toggle('on',on);
+  $('state').textContent=on?'Подключено: '+(dev?.name||'Nanachi-Watch'):'Не подключено';
+  ['bDisc','bSync','bSend','bLoad'].forEach(id=>$(id).disabled=!on);
+  $('bConnect').disabled=on;
+}
+
+// ---- Отправка на часы ----
+async function send(str){
+  if(!rx) throw new Error('Нет связи с часами');
+  const data=enc.encode(str);
+  for(let i=0;i<data.length;i+=CHUNK){
+    const part=data.slice(i,i+CHUNK);
+    if(rx.writeValueWithResponse) await rx.writeValueWithResponse(part); else await rx.writeValue(part);
+  }
+}
+
+// ---- Приём заметки с часов ----
+let rxBuf=[], rxNeed=-1, rxGot=0, rxTimer=null;
+function noteDone(){
+  clearTimeout(rxTimer);
+  const all=new Uint8Array(rxGot); let o=0;
+  for(const b of rxBuf){all.set(b,o);o+=b.length;}
+  rxNeed=-1; rxBuf=[]; rxGot=0;
+  $('note').value=dec.decode(all); updateCount();
+  log('Заметка с часов загружена.');
+}
+function onNotify(e){
+  const dv=e.target.value, v=new Uint8Array(dv.buffer,dv.byteOffset,dv.byteLength);
+  clearTimeout(rxTimer);
+  rxTimer=setTimeout(()=>{rxNeed=-1;rxBuf=[];rxGot=0;log('Часы не договорили заметку. Нажмите «Загрузить с часов».',true);},8000);
+  if(rxNeed<0){
+    const s=dec.decode(v);
+    if(s.startsWith('LEN:')){rxNeed=parseInt(s.slice(4))||0;rxBuf=[];rxGot=0;if(rxNeed===0)noteDone();}
+    return;
+  }
+  rxBuf.push(v.slice()); rxGot+=v.length;
+  if(rxGot>=rxNeed) noteDone();
+}
+async function loadNote(){
+  rxNeed=-1;
+  try{log('Запрашиваю заметку…');await send('GET:');}catch(e){log('Не удалось запросить: '+e.message,true);}
+}
+
+// ---- Подключение ----
+async function link(){
+  const srv=await dev.gatt.connect();
+  const svc=await srv.getPrimaryService(SERVICE);
+  rx=await svc.getCharacteristic(RX);
+  tx=await svc.getCharacteristic(TX);
+  await tx.startNotifications();
+  tx.addEventListener('characteristicvaluechanged',onNotify);
+  setUi(true);
+  await sendTime(); await sleep(150);
+  await loadNote(); await sleep(150);
+  try{await sendWeather();}catch(e){log('Погода: '+e.message,true);}
+  clearInterval(timer);
+  timer=setInterval(()=>syncAll().catch(()=>{}),30*60*1000);
+}
+async function connect(){
+  try{
+    manualOff=false;
+    dev=await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
+    dev.addEventListener('gattserverdisconnected',onDisc);
+    log('Подключаюсь…');
+    await link();
+  }catch(e){log(e.name==='NotFoundError'?'Устройство не выбрано.':'Ошибка подключения: '+e.message,true);setUi(false);}
+}
+async function onDisc(){
+  rx=null;tx=null;clearInterval(timer);setUi(false);
+  if(manualOff) return;
+  for(let i=1;i<=5&&!rx&&!manualOff;i++){
+    log('Связь потеряна, повтор '+i+' из 5…');
+    await sleep(3000);
+    try{await link();log('Подключено снова.');return;}catch(e){}
+  }
+  if(!rx) log('Не удалось переподключиться. Нажмите «Подключить часы».',true);
+}
+function disconnect(){manualOff=true;if(dev?.gatt?.connected)dev.gatt.disconnect();}
+
+// ---- Время и погода (по геолокации, без ввода города) ----
+const p2=n=>String(n).padStart(2,'0');
+async function sendTime(){const d=new Date();await send(`TIME:${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`);}
+
+const WX=[[0,'Ясно'],[1,'Почти ясно'],[2,'Перем. облачность'],[3,'Пасмурно'],[48,'Туман'],[57,'Морось'],[67,'Дождь'],[77,'Снег'],[82,'Ливень'],[86,'Снегопад'],[99,'Гроза']];
+const wxText=c=>(WX.find(([m])=>c<=m)||[0,'—'])[1];
+
+function gps(){return new Promise((ok,no)=>{
+  if(!navigator.geolocation) return no(new Error('нет геолокации'));
+  navigator.geolocation.getCurrentPosition(p=>ok({lat:p.coords.latitude,lon:p.coords.longitude}),e=>no(new Error(e.message)),{timeout:10000,maximumAge:1800000});
+});}
+async function place(){
+  try{const p=await gps();localStorage.setItem('pos',JSON.stringify(p));return p;}
+  catch(_){
+    try{const j=await (await fetch('https://get.geojs.io/v1/ip/geo.json')).json();return {lat:+j.latitude,lon:+j.longitude};}
+    catch(__){const s=localStorage.getItem('pos');if(s)return JSON.parse(s);throw new Error('не удалось определить местоположение (разрешите доступ к геолокации)');}
+  }
+}
+async function sendWeather(){
+  const pl=await place();
+  const r=await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${pl.lat}&longitude=${pl.lon}&current=temperature_2m,weather_code`);
+  const c=(await r.json()).current, t=Math.round(c.temperature_2m);
+  const line=`${t>0?'+':''}${t} C|${wxText(c.weather_code)}`;
+  await send('WEAT:'+line);
+  $('wx').textContent='На часах: '+line.replace('|',', ');
+}
+async function syncAll(){
+  await sendTime(); await sleep(150);
+  try{await sendWeather();log('Время и погода отправлены.');}
+  catch(e){log('Время отправлено. Погода: '+e.message,true);}
+}
+
+// ---- Заметка ----
+function updateCount(){
+  const n=enc.encode($('note').value).length;
+  $('count').textContent=n+' / '+MAX_BYTES+' байт';
+  $('count').className='meta'+(n>MAX_BYTES?' err':'');
+  localStorage.setItem('note',$('note').value);
+}
+async function sendNote(){
+  const text=$('note').value.trim();
+  if(!text) return log('Заметка пустая.',true);
+  if(enc.encode(text).length>MAX_BYTES) return log('Заметка длиннее лимита, лишнее часы обрежут.',true);
+  try{log('Отправляю…');await send('TEXT:'+text);log('Заметка отправлена.');}
+  catch(e){log('Не удалось отправить: '+e.message,true);}
+}
+
+// ---- Запуск ----
+$('note').value=localStorage.getItem('note')||'';
+updateCount();
+$('note').addEventListener('input',updateCount);
+$('bConnect').onclick=connect;
+$('bDisc').onclick=disconnect;
+$('bSync').onclick=()=>syncAll().catch(e=>log(e.message,true));
+$('bSend').onclick=sendNote;
+$('bLoad').onclick=loadNote;
+if(!('bluetooth' in navigator)){
+  $('bConnect').disabled=true;
+  $('support').textContent='Этот браузер не поддерживает Web Bluetooth. Используйте Chrome или Edge (Android, Windows, macOS). На iPhone нужен браузер Bluefy.';
+  $('support').className='meta err';
+}
+</script>
+</body>
+</html>
