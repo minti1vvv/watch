@@ -73,6 +73,8 @@ let dev=null, rx=null, tx=null, timer=null;
 let manualOff=false;   // true после нажатия «Отключить» - авто-переподключение выключено
 let busy=false;        // идёт подключение/переподключение
 let connected=false;
+let btOn=null;         // состояние Bluetooth-адаптера телефона (null - неизвестно)
+let inflight=0;        // сколько записей сейчас в очереди
 
 function log(msg,bad){const el=$('log');el.textContent=msg;el.className='meta'+(bad?' err':'');}
 
@@ -105,6 +107,8 @@ function send(str){
     }
   });
   sendQ=job.catch(()=>{});
+  inflight++;
+  job.then(()=>{inflight--;},()=>{inflight--; if(!dev?.gatt?.connected) lost();});   // ошибка записи + нет GATT = связь потеряна
   return job;
 }
 
@@ -184,6 +188,7 @@ async function connect(){
 async function onDisc(){
   rx=null; tx=null; clearInterval(timer); rxReset(); setUi(false);
   if(manualOff||busy||!dev) return;
+  if(btOn===false){log('Bluetooth на телефоне выключен. Включите его - часы подключатся сами.',true);return;}
   setBusy(true);
   try{
     for(let i=1;i<=3&&!manualOff;i++){
@@ -194,6 +199,32 @@ async function onDisc(){
     }
     if(!manualOff) log('Не удалось переподключиться. Нажмите «Подключить часы».',true);
   }finally{ setBusy(false); }
+}
+
+// ---- Обнаружение потери связи ----
+// Chrome не всегда присылает gattserverdisconnected (например, при выключении Bluetooth на телефоне),
+// поэтому страница проверяет связь сама: событие availabilitychanged, флаг gatt.connected и PING: раз в 10 с.
+function lost(){
+  if(!connected||busy||manualOff) return;
+  sendQ=Promise.resolve();               // зависшая запись не должна блокировать очередь
+  onDisc();
+}
+async function heartbeat(){
+  if(!connected||busy||manualOff) return;
+  if(!dev?.gatt?.connected) return lost();
+  if(inflight>0) return;                 // идёт обмен - он сам покажет обрыв
+  try{await withTimeout(send('PING:'),8000,'нет ответа');}   // старые часы неизвестную команду игнорируют
+  catch(_){lost();}
+}
+setInterval(heartbeat,10000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden) heartbeat();});
+if(hasBT){
+  navigator.bluetooth.getAvailability?.().then(v=>{btOn=v;}).catch(()=>{});
+  navigator.bluetooth.addEventListener?.('availabilitychanged',e=>{
+    btOn=e.value;
+    if(!e.value) lost();                                         // Bluetooth выключили
+    else if(dev&&!manualOff&&!connected&&!busy) onDisc();        // включили - пробуем вернуться
+  });
 }
 
 // Отключение: часы получают BYE: и сами рвут связь (надёжно даже в Chrome на Android),
