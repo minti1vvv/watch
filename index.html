@@ -27,7 +27,7 @@ textarea{font:inherit;width:100%;background:var(--bg);color:var(--ink);border:1p
 </style>
 </head>
 <body>
-<h1>Nanachi Watch</h1>
+<h1>Nanachi Watch <span class="meta" style="font-weight:400">v5</span></h1>
 
 <section id="conn">
   <div class="st"><span class="dot"></span><span id="state">Не подключено</span></div>
@@ -61,32 +61,56 @@ textarea{font:inherit;width:100%;background:var(--bg);color:var(--ink);border:1p
 
 <script>
 const SERVICE='6e400001-b5a3-f393-e0a9-e50e24dcca9e', RX='6e400002-b5a3-f393-e0a9-e50e24dcca9e', TX='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
-const MAX_BYTES=3900, CHUNK=100;
+const MAX_BYTES=3900, CHUNK=100, ETX='\u0003';   // ETX - маркер конца сообщения (часы v5 его ждут)
 const $=id=>document.getElementById(id);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const enc=new TextEncoder(), dec=new TextDecoder();
-let dev=null, rx=null, tx=null, timer=null, manualOff=false;
+const hasBT='bluetooth' in navigator;
+const ls={get:k=>{try{return localStorage.getItem(k);}catch(_){return null;}},
+          set:(k,v)=>{try{localStorage.setItem(k,v);}catch(_){}}};
+
+let dev=null, rx=null, tx=null, timer=null;
+let manualOff=false;   // true после нажатия «Отключить» - авто-переподключение выключено
+let busy=false;        // идёт подключение/переподключение
+let connected=false;
 
 function log(msg,bad){const el=$('log');el.textContent=msg;el.className='meta'+(bad?' err':'');}
-function setUi(on){
-  $('conn').classList.toggle('on',on);
-  $('state').textContent=on?'Подключено: '+(dev?.name||'Nanachi-Watch'):'Не подключено';
-  ['bDisc','bSync','bSend','bLoad'].forEach(id=>$(id).disabled=!on);
-  $('bConnect').disabled=on;
+
+function refresh(){
+  $('conn').classList.toggle('on',connected);
+  $('state').textContent=connected?'Подключено: '+(dev?.name||'Nanachi-Watch'):(busy?'Подключение…':'Не подключено');
+  $('bConnect').disabled=connected||busy||!hasBT;
+  $('bDisc').disabled=!(connected||busy);          // во время подключения можно отменить
+  ['bSync','bSend','bLoad'].forEach(id=>$(id).disabled=!connected);
+}
+function setUi(on){connected=on;refresh();}
+function setBusy(b){busy=b;refresh();}
+
+function withTimeout(p,ms,msg){
+  let t;
+  const to=new Promise((_,rej)=>{t=setTimeout(()=>rej(new Error(msg)),ms);});
+  return Promise.race([p,to]).finally(()=>clearTimeout(t));
 }
 
-// ---- Отправка на часы ----
-async function send(str){
-  if(!rx) throw new Error('Нет связи с часами');
-  const data=enc.encode(str);
-  for(let i=0;i<data.length;i+=CHUNK){
-    const part=data.slice(i,i+CHUNK);
-    if(rx.writeValueWithResponse) await rx.writeValueWithResponse(part); else await rx.writeValue(part);
-  }
+// ---- Отправка на часы (все записи идут строго по очереди) ----
+let sendQ=Promise.resolve();
+function send(str){
+  const job=sendQ.then(async()=>{
+    const ch=rx;
+    if(!ch) throw new Error('Нет связи с часами');
+    const data=enc.encode(str+ETX);
+    for(let i=0;i<data.length;i+=CHUNK){
+      const part=data.slice(i,i+CHUNK);
+      if(ch.writeValueWithResponse) await ch.writeValueWithResponse(part); else await ch.writeValue(part);
+    }
+  });
+  sendQ=job.catch(()=>{});
+  return job;
 }
 
 // ---- Приём заметки с часов ----
 let rxBuf=[], rxNeed=-1, rxGot=0, rxTimer=null;
+function rxReset(){clearTimeout(rxTimer);rxNeed=-1;rxBuf=[];rxGot=0;}
 function noteDone(){
   clearTimeout(rxTimer);
   const all=new Uint8Array(rxGot); let o=0;
@@ -98,7 +122,7 @@ function noteDone(){
 function onNotify(e){
   const dv=e.target.value, v=new Uint8Array(dv.buffer,dv.byteOffset,dv.byteLength);
   clearTimeout(rxTimer);
-  rxTimer=setTimeout(()=>{rxNeed=-1;rxBuf=[];rxGot=0;log('Часы не договорили заметку. Нажмите «Загрузить с часов».',true);},8000);
+  rxTimer=setTimeout(()=>{rxReset();log('Часы не договорили заметку. Нажмите «Загрузить с часов».',true);},8000);
   if(rxNeed<0){
     const s=dec.decode(v);
     if(s.startsWith('LEN:')){rxNeed=parseInt(s.slice(4))||0;rxBuf=[];rxGot=0;if(rxNeed===0)noteDone();}
@@ -108,45 +132,85 @@ function onNotify(e){
   if(rxGot>=rxNeed) noteDone();
 }
 async function loadNote(){
-  rxNeed=-1;
+  rxReset();
   try{log('Запрашиваю заметку…');await send('GET:');}catch(e){log('Не удалось запросить: '+e.message,true);}
 }
 
 // ---- Подключение ----
+// Любой сбой внутри link() закрывает GATT: нельзя оставлять «полуоткрытую» связь,
+// из-за неё часы считают себя подключёнными и перестают рекламироваться.
 async function link(){
-  const srv=await dev.gatt.connect();
-  const svc=await srv.getPrimaryService(SERVICE);
-  rx=await svc.getCharacteristic(RX);
-  tx=await svc.getCharacteristic(TX);
-  await tx.startNotifications();
-  tx.addEventListener('characteristicvaluechanged',onNotify);
-  setUi(true);
-  await sendTime(); await sleep(150);
-  await loadNote(); await sleep(150);
-  try{await sendWeather();}catch(e){log('Погода: '+e.message,true);}
-  clearInterval(timer);
-  timer=setInterval(()=>syncAll().catch(()=>{}),30*60*1000);
-}
-async function connect(){
   try{
-    manualOff=false;
-    dev=await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
-    dev.addEventListener('gattserverdisconnected',onDisc);
-    log('Подключаюсь…');
-    await link();
-  }catch(e){log(e.name==='NotFoundError'?'Устройство не выбрано.':'Ошибка подключения: '+e.message,true);setUi(false);}
-}
-async function onDisc(){
-  rx=null;tx=null;clearInterval(timer);setUi(false);
-  if(manualOff) return;
-  for(let i=1;i<=5&&!rx&&!manualOff;i++){
-    log('Связь потеряна, повтор '+i+' из 5…');
-    await sleep(3000);
-    try{await link();log('Подключено снова.');return;}catch(e){}
+    const srv=await withTimeout(dev.gatt.connect(),15000,'таймаут подключения');
+    if(manualOff) throw new Error('отменено');
+    const svc=await srv.getPrimaryService(SERVICE);
+    rx=await svc.getCharacteristic(RX);
+    tx=await svc.getCharacteristic(TX);
+    tx.addEventListener('characteristicvaluechanged',onNotify);   // слушатель - ДО startNotifications
+    await tx.startNotifications();
+    setUi(true);
+    await sendTime(); await sleep(150);
+    if(!$('note').value.trim()){await loadNote(); await sleep(150);}   // не затираем текст в поле
+    try{await sendWeather();}catch(e){log('Погода: '+e.message,true);}
+    if(!dev.gatt.connected) throw new Error('связь потеряна');
+    clearInterval(timer);
+    timer=setInterval(()=>syncAll().catch(()=>{}),30*60*1000);
+  }catch(e){
+    try{dev?.gatt?.disconnect();}catch(_){}
+    rx=null; tx=null; clearInterval(timer); setUi(false);
+    throw e;
   }
-  if(!rx) log('Не удалось переподключиться. Нажмите «Подключить часы».',true);
 }
-function disconnect(){manualOff=true;if(dev?.gatt?.connected)dev.gatt.disconnect();}
+
+async function connect(){
+  if(busy||connected) return;
+  manualOff=false; setBusy(true);          // до первого await: окно выбора требует жеста пользователя
+  try{
+    if(!dev){
+      dev=await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
+      const d=dev;
+      d.addEventListener('gattserverdisconnected',()=>{ if(d===dev) onDisc(); });
+    }
+    for(let i=1;i<=3&&!manualOff;i++){
+      try{log('Подключаюсь… '+i+' из 3');await link();return;}
+      catch(e){ if(manualOff) return; if(i===3) throw e; await sleep(1500); }
+    }
+  }catch(e){
+    log(e.name==='NotFoundError'?'Устройство не выбрано.':'Не удалось подключиться: '+e.message+'. Нажмите «Подключить часы» ещё раз.',true);
+    dev=null;                               // сброс выбора: в следующий раз откроется новое окно поиска
+  }finally{ setBusy(false); }
+}
+
+async function onDisc(){
+  rx=null; tx=null; clearInterval(timer); rxReset(); setUi(false);
+  if(manualOff||busy||!dev) return;
+  setBusy(true);
+  try{
+    for(let i=1;i<=3&&!manualOff;i++){
+      log('Связь потеряна, повтор '+i+' из 3…');
+      await sleep(3000);
+      if(manualOff||!dev) return;
+      try{await link();return;}catch(_){}
+    }
+    if(!manualOff) log('Не удалось переподключиться. Нажмите «Подключить часы».',true);
+  }finally{ setBusy(false); }
+}
+
+// Отключение: часы получают BYE: и сами рвут связь (надёжно даже в Chrome на Android),
+// затем страховочно закрываем GATT со стороны браузера.
+async function disconnect(){
+  manualOff=true; clearInterval(timer);
+  const d=dev;
+  if(d?.gatt?.connected){
+    const gone=new Promise(r=>d.addEventListener('gattserverdisconnected',r,{once:true}));
+    try{ if(tx){tx.removeEventListener('characteristicvaluechanged',onNotify); await tx.stopNotifications();} }catch(_){}
+    try{ if(rx) await send('BYE:'); }catch(_){}
+    await Promise.race([gone,sleep(2000)]);
+  }
+  try{ d?.gatt?.disconnect(); }catch(_){}    // также отменяет незавершённое подключение
+  rx=null; tx=null; rxReset(); setUi(false);
+  log('Отключено.');
+}
 
 // ---- Время и погода (по геолокации, без ввода города) ----
 const p2=n=>String(n).padStart(2,'0');
@@ -160,15 +224,16 @@ function gps(){return new Promise((ok,no)=>{
   navigator.geolocation.getCurrentPosition(p=>ok({lat:p.coords.latitude,lon:p.coords.longitude}),e=>no(new Error(e.message)),{timeout:10000,maximumAge:1800000});
 });}
 async function place(){
-  try{const p=await gps();localStorage.setItem('pos',JSON.stringify(p));return p;}
+  try{const p=await gps();ls.set('pos',JSON.stringify(p));return p;}
   catch(_){
     try{const j=await (await fetch('https://get.geojs.io/v1/ip/geo.json')).json();return {lat:+j.latitude,lon:+j.longitude};}
-    catch(__){const s=localStorage.getItem('pos');if(s)return JSON.parse(s);throw new Error('не удалось определить местоположение (разрешите доступ к геолокации)');}
+    catch(__){const s=ls.get('pos');if(s)return JSON.parse(s);throw new Error('не удалось определить местоположение (разрешите доступ к геолокации)');}
   }
 }
 async function sendWeather(){
   const pl=await place();
   const r=await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${pl.lat}&longitude=${pl.lon}&current=temperature_2m,weather_code`);
+  if(!r.ok) throw new Error('сервис погоды: HTTP '+r.status);
   const c=(await r.json()).current, t=Math.round(c.temperature_2m);
   const line=`${t>0?'+':''}${t} C|${wxText(c.weather_code)}`;
   await send('WEAT:'+line);
@@ -185,7 +250,7 @@ function updateCount(){
   const n=enc.encode($('note').value).length;
   $('count').textContent=n+' / '+MAX_BYTES+' байт';
   $('count').className='meta'+(n>MAX_BYTES?' err':'');
-  localStorage.setItem('note',$('note').value);
+  ls.set('note',$('note').value);
 }
 async function sendNote(){
   const text=$('note').value.trim();
@@ -196,7 +261,7 @@ async function sendNote(){
 }
 
 // ---- Запуск ----
-$('note').value=localStorage.getItem('note')||'';
+$('note').value=ls.get('note')||'';
 updateCount();
 $('note').addEventListener('input',updateCount);
 $('bConnect').onclick=connect;
@@ -204,8 +269,8 @@ $('bDisc').onclick=disconnect;
 $('bSync').onclick=()=>syncAll().catch(e=>log(e.message,true));
 $('bSend').onclick=sendNote;
 $('bLoad').onclick=loadNote;
-if(!('bluetooth' in navigator)){
-  $('bConnect').disabled=true;
+refresh();
+if(!hasBT){
   $('support').textContent='Этот браузер не поддерживает Web Bluetooth. Используйте Chrome или Edge (Android, Windows, macOS). На iPhone нужен браузер Bluefy.';
   $('support').className='meta err';
 }
